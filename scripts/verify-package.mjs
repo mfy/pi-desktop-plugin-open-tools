@@ -14,7 +14,14 @@
  *     are exactly the file on disk;
  *   - `manifest.json` is the first thing the installer needs, and the id and
  *     version inside it match the archive name;
- *   - at most 2000 entries and at most 50 MB uncompressed.
+ *   - at most 2000 entries and at most 50 MB uncompressed;
+ *   - the archive holds **exactly** the files the manifest references — no
+ *     `scripts/`, no `README.md`, no `.git*` (the marketplace audit reads every
+ *     packaged file);
+ *   - packaged `.js/.mjs/.cjs` files contain no dynamic or remote code
+ *     execution (`import(...)`, `eval(...)`, `new Function(...)`,
+ *     `importScripts(...)`, a computed `require(...)`), which is what SEC003
+ *     refuses.
  *
  * Exit code 0 means every rule passed.
  */
@@ -30,6 +37,47 @@ const archivePath = join(pluginRoot, "dist", `${manifest.id}-${manifest.version}
 const MAX_ENTRIES = 2000;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const FORBIDDEN_SEGMENTS = new Set([".git", "node_modules", "dist"]);
+/** Development-only things that must never reach a published package. */
+const DEVELOPMENT_ENTRY = /^(scripts\/|\.git|README\.md$)/i;
+
+/** File types the marketplace audit reads as code. */
+const SCANNED_EXTENSIONS = [".js", ".mjs", ".cjs"];
+
+/**
+ * The audit (SEC003) refuses "dynamic or remote code execution". Same shape of
+ * check, applied here so a rejected upload is never a surprise.
+ */
+const DYNAMIC_CODE_RULES = [
+  { label: "dynamic module loading", pattern: /\bimport\s*\(/ },
+  { label: "eval", pattern: /(^|[^.\w$])eval\s*\(/ },
+  { label: "new Function", pattern: /\bnew\s+Function\s*\(/ },
+  { label: "importScripts", pattern: /\bimportScripts\s*\(/ },
+  { label: "require with a computed specifier", pattern: /\brequire\s*\(\s*[^"'`\s)]/ }
+];
+
+/**
+ * Every path the manifest points at. Mirrors scripts/pack.mjs: a package holds
+ * the runtime and nothing else.
+ */
+function shippedPaths(source) {
+  const paths = new Set(["manifest.json"]);
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    paths.add(trimmed.replace(/\\/g, "/").replace(/^\.\//, ""));
+  };
+  add(source.main);
+  add(source.renderer);
+  add(source.ui && source.ui.panel);
+  const contributes = source.contributes || {};
+  for (const skill of contributes.skills || []) add(typeof skill === "string" ? skill : skill && skill.path);
+  for (const extension of contributes.agentExtensions || []) add(extension);
+  for (const theme of contributes.themes || []) add(theme && theme.path);
+  for (const view of Object.values(contributes.views || {})) add(typeof view === "string" ? view : view && view.entry);
+  return [...paths].sort();
+}
+
 
 const failures = [];
 const passes = [];
@@ -56,6 +104,13 @@ function crc32(buffer) {
     crc = CRC_TABLE[(crc ^ buffer[index]) & 0xff] ^ (crc >>> 8);
   }
   return (crc ^ -1) >>> 0;
+}
+
+function readEntry(archive, entry) {
+  const localNameLength = archive.readUInt16LE(entry.localOffset + 26);
+  const localExtraLength = archive.readUInt16LE(entry.localOffset + 28);
+  const dataStart = entry.localOffset + 30 + localNameLength + localExtraLength;
+  return archive.subarray(dataStart, dataStart + entry.uncompressedSize);
 }
 
 function findEndRecord(buffer) {
@@ -170,6 +225,38 @@ if (existsSync(archivePath)) {
       totalBytes <= MAX_TOTAL_BYTES,
       `at most 50 MB uncompressed (found ${totalBytes} bytes)`
     );
+    const packagedNames = [...names].sort();
+    // --- the package is the runtime, and only the runtime ---------------
+    // The audit reads every packaged file, so one stray dev script (a harness
+    // that calls import() on a path, say) is enough to reject the upload.
+    const expected = shippedPaths(manifest);
+    check(
+      packagedNames.length === expected.length && packagedNames.every((name, index) => name === expected[index]),
+      `the package holds exactly the files the manifest references (${expected.join(", ")})`
+    );
+    for (const name of packagedNames) {
+      check(!DEVELOPMENT_ENTRY.test(name), `${name}: the package ships no development files`);
+    }
+
+    // Same shape of scan the marketplace audit applies, before uploading.
+    let scannedFiles = 0;
+    for (const entry of entries) {
+      const lower = entry.name.toLowerCase();
+      if (!SCANNED_EXTENSIONS.some((extension) => lower.endsWith(extension))) continue;
+      scannedFiles += 1;
+      const lines = readEntry(archive, entry).toString("utf8").split(/\r?\n/);
+      let findings = 0;
+      for (let index = 0; index < lines.length; index += 1) {
+        for (const rule of DYNAMIC_CODE_RULES) {
+          if (!rule.pattern.test(lines[index])) continue;
+          findings += 1;
+          check(false, `${entry.name}:${index + 1}: the audit would flag this (${rule.label})`);
+        }
+      }
+      check(findings === 0, `${entry.name}: no dynamic or remote code execution`);
+    }
+    check(scannedFiles > 0, `the scan covered the packaged code (${scannedFiles} files)`);
+
 
     const manifestEntry = entries.find((entry) => entry.name === "manifest.json");
     check(Boolean(manifestEntry), "manifest.json is in the archive");

@@ -9,7 +9,7 @@
 - 没有打开项目时按钮置灰，悬停提示给出原因
 - 双击/回车打开菜单，方向键移动，Esc 或点空白处关闭
 
-版本 `0.4.0`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en）。
+版本 `0.4.1`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en）。
 
 > **id 变更**：0.4 之前插件的 id 是 `local.pi-open-tools`。宿主强制 id 必须含点
 > （`^[a-z0-9]+(\.[a-z0-9_-]+)+$`），所以现在叫 `mfy.pi-desktop-open-tools`，显示名不变。
@@ -29,10 +29,35 @@
 
 **方式 B：安装发布包**
 
-1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.4.0.piplug`）
+1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.4.1.piplug`）
 2. 插件页 → 安装本地插件 → 选这个 `.piplug`
 
 两种方式都需要在**打开了项目**的会话里使用（插件把当前项目根目录作为目标）。
+
+## 发布包里有什么
+
+包装的是**运行时，不是仓库**：`manifest.json` 加上 manifest 指向的每一个文件
+（`main` / `renderer` / `ui.panel` / `contributes.skills` / `contributes.agentExtensions` /
+`contributes.themes[].path` / `contributes.views[].entry`）。当前只有三个文件：
+
+```
+manifest.json
+main.js
+renderer/index.mjs
+```
+
+`scripts/`、`README.md`、`.gitignore`、`.gitattributes`、`dist/` 一律不进包。原因是插件市场
+审计会逐个读取包内文件，任何一处动态代码执行都会判定为阻断项：
+
+```
+SEC003 <包名>:<文件>:<行号>: dynamic or remote code execution: dynamic module loading
+```
+
+开发脚本为了加载被测模块用的 `import(path)` 正是这种形态，所以它们只留在仓库里。
+`scripts/pack.mjs` 采集文件时只认 manifest 的引用（引用越界或文件缺失直接 `FAIL`），
+`scripts/verify-package.mjs` 再反过来断言「包内条目集合 == manifest 引用集合」，并对包内
+`.js/.mjs/.cjs` 做一次和审计同形的扫描（`import(...)`、`eval(...)`、`new Function(...)`、
+`importScripts(...)`、非字面量的 `require(...)`）。运行时三个文件里只有字面量 `require("node:…")`。
 
 ## 日常使用
 
@@ -279,7 +304,7 @@ Select-String -Path "$env:USERPROFILE\.pi-desktop\logs\app\plugin.log" -Pattern 
 | `renderer/index.mjs` | 渲染器模块：`composerControl` 按钮 + 下拉菜单 + 配置面板（纯 DOM，无 JSX、无构建） |
 | `scripts/selftest.mjs` | 离线自测（桩宿主、桩 react，277 条断言） |
 | `scripts/verify-manifest.mjs` | manifest 规则校验（同宿主安装器规则，79 条断言） |
-| `scripts/pack.mjs` | 生成 store-only `.piplug` |
-| `scripts/verify-package.mjs` | 发布包结构/CRC/路径/体积校验 |
+| `scripts/pack.mjs` | 生成 store-only `.piplug`（只采集 manifest 引用的运行时文件） |
+| `scripts/verify-package.mjs` | 发布包校验：结构/CRC/路径/体积 + 包内条目集合 == manifest 引用集合 + 动态代码扫描（同 SEC003 口径） |
 | `scripts/smoke.mjs` | 对每个探测到的工具做一次真实启动 |
 | `dist/*.piplug` | 发布产物（不进包、不进版本库） |

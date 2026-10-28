@@ -6,38 +6,62 @@
  * compression method 0, because the installer rejects deflated entries. The
  * host's own `PluginPack` tool does this; it is not available in every session,
  * so this script writes the archive itself — local file headers, a central
- * directory and the end record, nothing else. `.git`, `node_modules`, `dist`
- * and the host's `.pi` folder are never packaged.
+ * directory and the end record, nothing else.
+ *
+ * What goes in is the *runtime*, nothing else: manifest.json plus every file the
+ * manifest points at (main, renderer, panel, skills, themes, views, agent
+ * extensions). The repository is never walked, so `scripts/`, `README.md`,
+ * `.git*` and the host's `.pi` folder cannot leak into a published package — the
+ * marketplace audit reads every packaged file and refuses a plugin whose tools
+ * ship dynamic module loading.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const EXCLUDED_DIRECTORY_NAMES = new Set([".git", "node_modules", "dist", ".pi"]);
-// Repo metadata is not plugin content: a .piplug should carry the sources only.
-const EXCLUDED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes", ".gitmodules"]);
 
-function collectFiles(directory, baseDirectory, collected) {
-  for (const name of readdirSync(directory).sort()) {
-    if (EXCLUDED_FILE_NAMES.has(name)) continue;
-    const absolute = join(directory, name);
-    const info = statSync(absolute, { bigint: false });
-    if (info.isDirectory()) {
-      if (EXCLUDED_DIRECTORY_NAMES.has(name)) continue;
-      collectFiles(absolute, baseDirectory, collected);
-      continue;
+/** Every path the manifest references, as package-relative names. */
+function shippedPaths(manifest) {
+  const paths = new Set(["manifest.json"]);
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    paths.add(trimmed.replace(/\\/g, "/").replace(/^\.\//, ""));
+  };
+
+  add(manifest.main);
+  add(manifest.renderer);
+  add(manifest.ui && manifest.ui.panel);
+
+  const contributes = manifest.contributes || {};
+  for (const skill of contributes.skills || []) add(typeof skill === "string" ? skill : skill && skill.path);
+  for (const extension of contributes.agentExtensions || []) add(extension);
+  for (const theme of contributes.themes || []) add(theme && theme.path);
+  for (const view of Object.values(contributes.views || {})) add(typeof view === "string" ? view : view && view.entry);
+
+  return [...paths].sort();
+}
+
+/** Resolve every shipped path, refusing anything outside the plugin directory. */
+function resolveShippedFiles(paths) {
+  const files = [];
+  for (const archiveName of paths) {
+    const absolutePath = resolve(pluginRoot, archiveName);
+    const inside = relative(pluginRoot, absolutePath);
+    if (!inside || inside.startsWith("..") || isAbsolute(inside) || inside.split(sep).includes("..")) {
+      throw new Error("manifest references a path outside the plugin: " + archiveName);
     }
-    if (!info.isFile()) continue;
-    if (name.endsWith("~")) continue;
-    collected.push({
-      archiveName: relative(baseDirectory, absolute).split(/[\\/]/).join("/"),
-      absolutePath: absolute,
-      mtime: info.mtime
-    });
+    if (!existsSync(absolutePath)) {
+      throw new Error("manifest references a file that does not exist: " + archiveName);
+    }
+    const info = statSync(absolutePath);
+    if (!info.isFile()) throw new Error("manifest references something that is not a file: " + archiveName);
+    files.push({ archiveName, absolutePath, mtime: info.mtime });
   }
-  return collected;
+  return files;
 }
 
 const CRC_TABLE = (() => {
@@ -131,7 +155,13 @@ function buildStoreOnlyZip(entries) {
 }
 
 const manifest = JSON.parse(readFileSync(join(pluginRoot, "manifest.json"), "utf8"));
-const files = collectFiles(pluginRoot, pluginRoot, []);
+let files;
+try {
+  files = resolveShippedFiles(shippedPaths(manifest));
+} catch (error) {
+  console.error("FAIL: " + String((error && error.message) || error));
+  process.exit(1);
+}
 if (!files.some((file) => file.archiveName === "manifest.json")) {
   console.error("FAIL: manifest.json is not part of the package");
   process.exit(1);
@@ -152,3 +182,5 @@ writeFileSync(outputPath, archive);
 console.log(`packed ${entries.length} files into ${outputPath}`);
 console.log(`stored (uncompressed) size: ${archive.length} bytes`);
 for (const entry of entries) console.log("  " + entry.archiveName + "  " + entry.data.length + " bytes");
+const skipped = ["scripts/", "README.md", ".git/", "dist/"].join(", ");
+console.log(`not packaged (runtime only): ${skipped}`);
