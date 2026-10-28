@@ -9,7 +9,7 @@
 - 没有打开项目时按钮置灰，悬停提示给出原因
 - 双击/回车打开菜单，方向键移动，Esc 或点空白处关闭
 
-版本 `0.4.1`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en）。
+版本 `0.4.2`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en）。
 
 > **id 变更**：0.4 之前插件的 id 是 `local.pi-open-tools`。宿主强制 id 必须含点
 > （`^[a-z0-9]+(\.[a-z0-9_-]+)+$`），所以现在叫 `mfy.pi-desktop-open-tools`，显示名不变。
@@ -29,7 +29,7 @@
 
 **方式 B：安装发布包**
 
-1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.4.1.piplug`）
+1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.4.2.piplug`）
 2. 插件页 → 安装本地插件 → 选这个 `.piplug`
 
 两种方式都需要在**打开了项目**的会话里使用（插件把当前项目根目录作为目标）。

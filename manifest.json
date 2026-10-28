@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "mfy.pi-desktop-open-tools",
   "name": "Open Tools",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A composer toolbar button that opens the current project folder in an external tool: VS Code, File Explorer, Command Prompt, Windows PowerShell, PowerShell 7, Git Bash, Windows Terminal or WSL. Every tool is probed on this machine, so only the ones really installed are listed; a tool that is missing simply never appears. The list itself is yours: enable, disable, rename, re-argument, re-order, delete the built-in tools, or add a program of your own — all of it in one sheet behind the button, which is also the only place the list is edited. Launches never go through a shell: a fixed executable plus an argv array, with the project folder as one argument and as the working directory.",
-  "author": "local",
+  "author": "mfy",
   "categories": [
     "productivity"
   ],

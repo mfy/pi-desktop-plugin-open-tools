@@ -21,7 +21,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const PLUGIN_ID = "mfy.pi-desktop-open-tools";
-const PLUGIN_VERSION = "0.4.1";
+const PLUGIN_VERSION = "0.4.2";
 const DETECTION_TTL_MS = 60 * 1000;
 
 /**
