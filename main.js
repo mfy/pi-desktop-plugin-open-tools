@@ -21,7 +21,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const PLUGIN_ID = "mfy.pi-desktop-open-tools";
-const PLUGIN_VERSION = "0.4.2";
+const PLUGIN_VERSION = "0.5.0";
 const DETECTION_TTL_MS = 60 * 1000;
 
 /**
@@ -33,107 +33,352 @@ const DETECTION_TTL_MS = 60 * 1000;
 const HOST_ONLY_ENV_KEYS = ["ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ATTACH_CONSOLE", "PI_PLUGIN_ID", "NODE_ENV"];
 
 /**
- * The whole tool set. Order is the order of the menu.
- *
- * `argv(root)` returns the argument array for that tool. In every entry the
- * project folder travels in exactly one element and in no other element is it
- * mentioned, which is what keeps it a value rather than part of a command
- * line. Git Bash is the one tool whose launcher only understands the folder as
- * `--cd=<folder>` (a bare folder argument makes git-bash.exe try to run it as a
- * program), so there the folder rides inside the option element; the folder is
- * passed as the working directory as well.
+ * Variables that only mean something on Windows. A POSIX child must not see
+ * them: `OS=Windows_NT` alone is enough to make a program believe it runs on
+ * Windows NT.
  */
-const TOOLS = [
+const WINDOWS_ONLY_ENV_KEYS = [
+  "OS",
+  "PATHEXT",
+  "ComSpec",
+  "SystemRoot",
+  "windir",
+  "SystemDrive",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramW6432",
+  "CommonProgramFiles",
+  "ProgramData",
+  "PUBLIC",
+  "LOCALAPPDATA",
+  "APPDATA",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "USERPROFILE",
+  "USERDOMAIN",
+  "COMPUTERNAME",
+  "SESSIONNAME",
+  "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE"
+];
+
+/* ---------------------------------------------------------------- platforms
+ *
+ * One tool table per system family. The rest of this module never asks the
+ * operating system a question directly: it asks a table where a tool lives,
+ * how its command line is built, and whether it needs a terminal host. Adding
+ * a system therefore means adding a table, not sprinkling the code with
+ * `if (process.platform …)`.
+ *
+ * Anything that is neither Windows nor macOS is treated as Linux/POSIX: the
+ * flat layout (/usr/bin/code), `xdg-open` and the usual terminal emulators
+ * cover the BSDs too.
+ */
+const PLATFORM_WINDOWS = "win32";
+const PLATFORM_MACOS = "darwin";
+const PLATFORM_LINUX = "linux";
+const PLATFORMS = [PLATFORM_WINDOWS, PLATFORM_MACOS, PLATFORM_LINUX];
+
+/** A platform name this module understands; anything unknown counts as Linux. */
+function normalizePlatform(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (raw === PLATFORM_WINDOWS || raw === PLATFORM_MACOS || raw === PLATFORM_LINUX) return raw;
+  if (raw) return PLATFORM_LINUX;
+  const host = process.platform;
+  if (host === PLATFORM_WINDOWS) return PLATFORM_WINDOWS;
+  if (host === PLATFORM_MACOS) return PLATFORM_MACOS;
+  return PLATFORM_LINUX;
+}
+
+/** The platform this process runs on. */
+const HOST_PLATFORM = normalizePlatform("");
+
+/**
+ * Every built-in tool, per platform. Order is the order of the menu.
+ *
+ * A tool has one or more *variants*, best first. A variant is one way of
+ * finding and starting the tool: `candidates(env)` lists absolute locations to
+ * try, `executableNames` is what to look for on PATH, `needs(env)` (optional)
+ * names paths that must exist for the variant to be usable at all — needed
+ * when the launcher is a fixed program such as macOS `open` and the app that
+ * decides availability lives somewhere else — and `argv(root)` builds the
+ * command line for the variant that matched.
+ *
+ * In every argv the project folder travels in exactly one element and is never
+ * assembled into a command line: Git Bash only understands `--cd=<folder>` (a
+ * bare folder argument makes git-bash.exe try to run it as a program), so there
+ * the folder rides inside the option element. The folder is always the working
+ * directory as well.
+ */
+const WINDOWS_TOOLS = [
   {
     id: "vscode",
     label: { en: "VS Code", "zh-CN": "VS Code" },
-    executableNames: ["Code.exe"],
-    candidates: (env) => [
-      path.join(env.LOCALAPPDATA || "", "Programs", "Microsoft VS Code", "Code.exe"),
-      path.join(env.ProgramFiles || "", "Microsoft VS Code", "Code.exe"),
-      path.join(env["ProgramFiles(x86)"] || "", "Microsoft VS Code", "Code.exe")
-    ],
-    argv: (root) => [root]
+    variants: [
+      {
+        executableNames: ["Code.exe"],
+        candidates: (env) => [
+          path.join(env.LOCALAPPDATA || "", "Programs", "Microsoft VS Code", "Code.exe"),
+          path.join(env.ProgramFiles || "", "Microsoft VS Code", "Code.exe"),
+          path.join(env["ProgramFiles(x86)"] || "", "Microsoft VS Code", "Code.exe")
+        ],
+        argv: (root) => [root]
+      }
+    ]
   },
   {
     id: "explorer",
     label: { en: "File Explorer", "zh-CN": "资源管理器" },
-    executableNames: ["explorer.exe"],
-    candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "explorer.exe")],
-    argv: (root) => [root]
+    variants: [
+      {
+        executableNames: ["explorer.exe"],
+        candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "explorer.exe")],
+        argv: (root) => [root]
+      }
+    ]
   },
   {
     id: "cmd",
     label: { en: "Command Prompt", "zh-CN": "命令提示符 (cmd)" },
-    executableNames: ["cmd.exe"],
-    candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "System32", "cmd.exe")],
+    variants: [
+      {
+        executableNames: ["cmd.exe"],
+        candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "System32", "cmd.exe")],
+        argv: (root) => ["/k", "cd", "/d", root]
+      }
+    ],
     // A console window needs a console host: cmd.exe does not allocate one
     // itself, and this plugin's process has no console to hand down, so Windows
     // Terminal opens the window and runs cmd.exe inside it.
-    consoleHost: "wt",
-    argv: (root) => ["/k", "cd", "/d", root]
+    consoleHost: "wt"
   },
   {
     id: "powershell",
     label: { en: "Windows PowerShell", "zh-CN": "Windows PowerShell" },
-    executableNames: ["powershell.exe"],
-    candidates: (env) => [
-      path.join(env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    variants: [
+      {
+        executableNames: ["powershell.exe"],
+        candidates: (env) => [
+          path.join(env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        ],
+        argv: (root) => ["-NoExit", "-Command", "Set-Location", "-LiteralPath", root]
+      }
     ],
-    consoleHost: "wt",
-    argv: (root) => ["-NoExit", "-Command", "Set-Location", "-LiteralPath", root]
+    consoleHost: "wt"
   },
   {
     id: "pwsh",
     label: { en: "PowerShell 7", "zh-CN": "PowerShell 7" },
-    executableNames: ["pwsh.exe"],
-    candidates: (env) => [
-      path.join(env.ProgramFiles || "", "PowerShell", "7", "pwsh.exe"),
-      path.join(env.ProgramFiles || "", "PowerShell", "7-preview", "pwsh.exe"),
-      path.join(env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "pwsh.exe")
+    variants: [
+      {
+        executableNames: ["pwsh.exe"],
+        candidates: (env) => [
+          path.join(env.ProgramFiles || "", "PowerShell", "7", "pwsh.exe"),
+          path.join(env.ProgramFiles || "", "PowerShell", "7-preview", "pwsh.exe"),
+          path.join(env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "pwsh.exe")
+        ],
+        argv: (root) => ["-NoExit", "-WorkingDirectory", root]
+      }
     ],
-    consoleHost: "wt",
-    argv: (root) => ["-NoExit", "-WorkingDirectory", root]
+    consoleHost: "wt"
   },
   {
     id: "gitbash",
     label: { en: "Git Bash", "zh-CN": "Git Bash" },
-    executableNames: ["git-bash.exe"],
-    candidates: (env) => [
-      path.join(env.ProgramFiles || "", "Git", "git-bash.exe"),
-      path.join(env["ProgramFiles(x86)"] || "", "Git", "git-bash.exe"),
-      path.join(env.LOCALAPPDATA || "", "Programs", "Git", "git-bash.exe")
-    ],
-    argv: (root) => ["--cd=" + root],
-    argvTarget: "option"
+    variants: [
+      {
+        executableNames: ["git-bash.exe"],
+        candidates: (env) => [
+          path.join(env.ProgramFiles || "", "Git", "git-bash.exe"),
+          path.join(env["ProgramFiles(x86)"] || "", "Git", "git-bash.exe"),
+          path.join(env.LOCALAPPDATA || "", "Programs", "Git", "git-bash.exe")
+        ],
+        argv: (root) => ["--cd=" + root]
+      }
+    ]
   },
   {
     id: "wt",
     label: { en: "Windows Terminal", "zh-CN": "Windows 终端" },
-    executableNames: ["wt.exe"],
-    candidates: (env) => [path.join(env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "wt.exe")],
-    argv: (root) => ["-d", root]
+    consoleHostRole: true,
+    variants: [
+      {
+        executableNames: ["wt.exe"],
+        candidates: (env) => [path.join(env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "wt.exe")],
+        argv: (root) => ["-d", root]
+      }
+    ]
   },
   {
     id: "wsl",
     label: { en: "WSL", "zh-CN": "WSL" },
-    executableNames: ["wsl.exe"],
-    candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "System32", "wsl.exe")],
-    argv: (root) => ["--cd", root]
+    variants: [
+      {
+        executableNames: ["wsl.exe"],
+        candidates: (env) => [path.join(env.SystemRoot || "C:\\Windows", "System32", "wsl.exe")],
+        argv: (root) => ["--cd", root]
+      }
+    ]
   }
 ];
 
-function toolById(id) {
-  return TOOLS.find((tool) => tool.id === id) || null;
+/**
+ * macOS: everything goes through LaunchServices (`open`), which is the only
+ * supported way to hand a folder to a windowed app. `open <folder>` opens
+ * Finder, `open -a <App> <folder>` starts an app on that folder. The GUI apps
+ * also install a command-line tool, and where it exists it is used directly
+ * because it opens a window on the folder without going through the app
+ * registry.
+ */
+const MACOS_TOOLS = [
+  {
+    id: "vscode",
+    label: { en: "VS Code", "zh-CN": "VS Code" },
+    variants: [
+      {
+        executableNames: ["code"],
+        candidates: (env) => [
+          "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+          path.join(env.HOME || "", "Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+          "/usr/local/bin/code",
+          "/opt/homebrew/bin/code"
+        ],
+        argv: (root) => [root]
+      },
+      {
+        // No shell command installed: ask LaunchServices for the app itself.
+        candidates: () => ["/usr/bin/open"],
+        needs: () => ["/Applications/Visual Studio Code.app", "/System/Applications/Visual Studio Code.app"],
+        argv: (root) => ["-a", "Visual Studio Code", root]
+      }
+    ]
+  },
+  {
+    id: "finder",
+    label: { en: "Finder", "zh-CN": "访达" },
+    variants: [
+      {
+        executableNames: ["open"],
+        candidates: () => ["/usr/bin/open"],
+        argv: (root) => [root]
+      }
+    ]
+  },
+  {
+    id: "terminal",
+    label: { en: "Terminal", "zh-CN": "终端" },
+    variants: [
+      {
+        executableNames: ["open"],
+        candidates: () => ["/usr/bin/open"],
+        needs: () => ["/System/Applications/Utilities/Terminal.app", "/Applications/Utilities/Terminal.app"],
+        argv: (root) => ["-a", "Terminal", root]
+      }
+    ]
+  },
+  {
+    id: "iterm",
+    label: { en: "iTerm2", "zh-CN": "iTerm2" },
+    variants: [
+      {
+        executableNames: ["open"],
+        candidates: () => ["/usr/bin/open"],
+        needs: () => ["/Applications/iTerm.app"],
+        argv: (root) => ["-a", "iTerm", root]
+      }
+    ]
+  }
+];
+
+/**
+ * Linux and the BSDs: a flat /usr/bin layout, `xdg-open` for the file manager,
+ * and the terminal emulators that accept a working directory on the command
+ * line. A terminal that can only be told `-e <command>` is left out: it would
+ * open at $HOME and quietly ignore the project folder.
+ */
+const LINUX_TOOLS = [
+  {
+    id: "vscode",
+    label: { en: "VS Code", "zh-CN": "VS Code" },
+    variants: [
+      {
+        executableNames: ["code", "code-insiders"],
+        candidates: () => ["/usr/share/code/code", "/usr/bin/code", "/snap/bin/code", "/opt/visual-studio-code/code"],
+        argv: (root) => [root]
+      }
+    ]
+  },
+  {
+    id: "filemanager",
+    label: { en: "File Manager", "zh-CN": "文件管理器" },
+    variants: [
+      {
+        executableNames: ["xdg-open"],
+        candidates: () => ["/usr/bin/xdg-open", "/bin/xdg-open"],
+        argv: (root) => [root]
+      }
+    ]
+  },
+  {
+    id: "terminal",
+    label: { en: "Terminal", "zh-CN": "终端" },
+    variants: [
+      {
+        executableNames: ["gnome-terminal"],
+        candidates: () => ["/usr/bin/gnome-terminal"],
+        argv: (root) => ["--working-directory", root]
+      },
+      {
+        executableNames: ["konsole"],
+        candidates: () => ["/usr/bin/konsole"],
+        argv: (root) => ["--workdir", root]
+      },
+      {
+        executableNames: ["xfce4-terminal"],
+        candidates: () => ["/usr/bin/xfce4-terminal"],
+        argv: (root) => ["--working-directory", root]
+      }
+    ]
+  }
+];
+
+const TOOL_TABLES = { win32: WINDOWS_TOOLS, darwin: MACOS_TOOLS, linux: LINUX_TOOLS };
+
+/** The table of the machine this process runs on. */
+const TOOLS = TOOL_TABLES[HOST_PLATFORM] || WINDOWS_TOOLS;
+
+/** The tools this plugin ships a table for on `platform`, in menu order. */
+function toolTable(platform) {
+  return TOOL_TABLES[normalizePlatform(platform === undefined ? HOST_PLATFORM : platform)] || WINDOWS_TOOLS;
+}
+
+/** One built-in tool of `platform` by id, or null. */
+function toolById(id, platform) {
+  return toolTable(platform).find((tool) => tool.id === id) || null;
+}
+
+/** The ids that are built-in on `platform`. */
+function builtinIds(platform) {
+  return new Set(toolTable(platform).map((tool) => tool.id));
+}
+
+/** The ids that can host a console window on `platform` (Windows Terminal only). */
+function consoleHostIds(platform) {
+  return new Set(
+    toolTable(platform)
+      .filter((tool) => tool.consoleHostRole === true)
+      .map((tool) => tool.id)
+  );
 }
 
 // ---------------------------------------------------------------- the menu list
 //
-// The eight tools above are the ones this plugin ships code for. What the menu
+// The tables above are the ones this plugin ships code for. What the menu
 // actually shows is the *tool list*: an ordered array of entries the user can
 // enable, disable, rename, re-argument, re-order, delete, and extend with tools
-// of their own. `null` — the default — means "the built-in eight". The list is
-// one JSON document in the plugin's own data directory (see "storage" below).
+// of their own. `null` — the default — means "the built-in tools of this
+// platform". The list is one JSON document in the plugin's own data directory
+// (see "storage" below).
 //
 // The stored shape is deliberately small, and every field is checked below:
 //
@@ -142,9 +387,10 @@ function toolById(id) {
 //
 // An entry whose id is a built-in id overrides that tool (label, arguments, and
 // optionally the executable); any other id is a custom tool and must carry an
-// absolute `.exe` plus an argv template with "{dir}" as a whole element.
+// absolute executable path plus an argv template with "{dir}" as a whole
+// element. Windows wants a `.exe` there; macOS and Linux accept any absolute
+// path to a program.
 
-const BUILTIN_IDS = new Set(TOOLS.map((tool) => tool.id));
 const SETTING_TOOLS = "tools";
 const LEGACY_SETTING_CUSTOM_TOOLS = "customTools";
 const CONFIG_FILE = "tools.json";
@@ -158,16 +404,15 @@ const MAX_TOOLS = 32;
 const MAX_TOOL_ARGS = 32;
 const MAX_ARG_LENGTH = 1024;
 const MAX_LABEL_LENGTH = 64;
-const CONSOLE_HOSTS = new Set(["wt"]);
 
-// The built-in menu, in table order, as the setting would store it.
-function defaultToolEntries() {
-  return TOOLS.map((tool) => ({ id: tool.id, enabled: true }));
+// The built-in menu of a platform, in table order, as the setting would store it.
+function defaultToolEntries(platform) {
+  return toolTable(platform).map((tool) => ({ id: tool.id, enabled: true }));
 }
 
 // The built-in tools and their default labels, so the UI can offer them back.
-function builtinDefaults(locale) {
-  return TOOLS.map((tool) => ({
+function builtinDefaults(locale, platform) {
+  return toolTable(platform).map((tool) => ({
     id: tool.id,
     label: localizedLabel(tool.label, locale),
     consoleHost: tool.consoleHost || null
@@ -182,7 +427,7 @@ function emptyToNull(value) {
 
 // One stored entry → its normalized shape, or the reason it was rejected.
 // Nothing here trusts the setting: this is the only door into the menu.
-function normalizeToolEntry(raw, index) {
+function normalizeToolEntry(raw, index, platform) {
   const where = "tools[" + index + "]";
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { reason: where + " must be an object" };
 
@@ -191,7 +436,7 @@ function normalizeToolEntry(raw, index) {
     const got = raw.id === undefined ? null : raw.id;
     return { reason: where + ".id must match [a-z][a-z0-9_-]{0,31} (got " + JSON.stringify(got) + ")" };
   }
-  const builtin = BUILTIN_IDS.has(id);
+  const builtin = builtinIds(platform).has(id);
 
   let label = null;
   const rawLabel = emptyToNull(raw.label);
@@ -217,8 +462,8 @@ function normalizeToolEntry(raw, index) {
     if (!path.isAbsolute(executable)) {
       return { reason: where + ".executable must be an absolute path (got " + JSON.stringify(executable) + ")" };
     }
-    if (!/\.exe$/i.test(executable)) {
-      return { reason: where + ".executable must name a .exe (got " + JSON.stringify(executable) + ")" };
+    if (normalizePlatform(platform) === PLATFORM_WINDOWS && !/\.exe$/i.test(executable)) {
+      return { reason: where + ".executable must name a .exe on Windows (got " + JSON.stringify(executable) + ")" };
     }
   }
 
@@ -250,8 +495,16 @@ function normalizeToolEntry(raw, index) {
   let consoleHost = null;
   const rawHost = emptyToNull(raw.consoleHost);
   if (rawHost !== null) {
-    if (typeof rawHost !== "string" || !CONSOLE_HOSTS.has(rawHost)) {
-      return { reason: where + '.consoleHost only supports "wt" (got ' + JSON.stringify(rawHost) + ")" };
+    const hosts = consoleHostIds(platform);
+    if (typeof rawHost !== "string" || !hosts.has(rawHost)) {
+      const allowed = [...hosts];
+      return {
+        reason:
+          where +
+          (allowed.length === 0
+            ? ".consoleHost is not used on " + normalizePlatform(platform) + " (got " + JSON.stringify(rawHost) + ")"
+            : ".consoleHost only supports " + JSON.stringify(allowed) + " (got " + JSON.stringify(rawHost) + ")")
+      };
     }
     consoleHost = rawHost;
   }
@@ -267,7 +520,7 @@ function normalizeToolEntry(raw, index) {
 }
 
 // The whole `tools` value → `{ entries, skipped }`; never throws.
-function normalizeToolEntries(raw) {
+function normalizeToolEntries(raw, platform) {
   if (raw === undefined || raw === null || raw === "") return { entries: [], skipped: [] };
   // A `json` setting can come back as text: pasting the array as a string is a
   // perfectly reasonable thing to do, so it is parsed rather than rejected.
@@ -293,7 +546,7 @@ function normalizeToolEntries(raw) {
   const entries = [];
   const skipped = [];
   raw.slice(0, MAX_TOOLS).forEach((rawEntry, index) => {
-    const normalized = normalizeToolEntry(rawEntry, index);
+    const normalized = normalizeToolEntry(rawEntry, index, platform);
     if (!normalized.entry) {
       skipped.push({ index, reason: normalized.reason });
       return;
@@ -325,17 +578,25 @@ function storedToolEntry(entry) {
   if (Array.isArray(entry.args)) stored.args = entry.args.slice();
   // Only persist a console host that differs from the built-in default: writing
   // the default back would freeze it if the table ever changes.
-  const template = entry.builtin ? toolById(entry.id) : null;
+  const template = entry.builtin ? toolById(entry.id, entry.platform) : null;
   const defaultConsoleHost = template ? template.consoleHost || null : null;
   if (entry.consoleHost && entry.consoleHost !== defaultConsoleHost) stored.consoleHost = entry.consoleHost;
   return stored;
 }
 
+// The argv template of one variant, with the folder as one whole element.
+function variantArgv(tool, variantIndex, root) {
+  if (!tool || !Array.isArray(tool.variants) || tool.variants.length === 0) return [root];
+  const index = typeof variantIndex === "number" && tool.variants[variantIndex] ? variantIndex : 0;
+  const variant = tool.variants[index];
+  return typeof variant.argv === "function" ? variant.argv(root).slice() : [root];
+}
+
 // The argv for one entry and one folder; the folder is always one element.
 function entryArgv(entry, root) {
   if (Array.isArray(entry.args)) return entry.args.map((arg) => (arg === DIR_PLACEHOLDER ? root : arg));
-  const template = entry.builtin ? toolById(entry.id) : null;
-  return template ? template.argv(root).slice() : [root];
+  const template = entry.builtin ? toolById(entry.id, entry.platform) : null;
+  return template ? variantArgv(template, entry.variant, root) : [root];
 }
 
 // The setting → the menu, resolved against this machine.
@@ -346,12 +607,11 @@ function entryArgv(entry, root) {
 // "ready" entries are offered, so a broken entry stays visible in the settings
 // UI but never in the menu.
 function resolveToolEntries(raw, context) {
-  const normalized = normalizeToolEntries(raw);
-  const hostTool = toolById("wt");
-  const consoleHostExecutable = hostTool ? resolveExecutable(hostTool, context) : null;
+  const platform = context.platform;
+  const normalized = normalizeToolEntries(raw, platform);
   const entries = [];
   for (const entry of normalized.entries) {
-    const template = entry.builtin ? toolById(entry.id) : null;
+    const template = entry.builtin ? toolById(entry.id, platform) : null;
     const label = entry.label
       ? { en: entry.label, "zh-CN": entry.label }
       : template
@@ -359,18 +619,26 @@ function resolveToolEntries(raw, context) {
         : { en: entry.id, "zh-CN": entry.id };
 
     let executable = null;
+    let variant = null;
     let reason = null;
     if (entry.executable) {
       if (isFile(entry.executable, context.fileSystem)) executable = entry.executable;
       else reason = "the executable is not there: " + entry.executable;
     } else if (template) {
-      executable = resolveExecutable(template, context);
-      if (!executable) reason = "not installed on this machine";
+      const found = locateTool(template, context);
+      if (found) {
+        executable = found.executable;
+        variant = found.variant;
+      } else {
+        reason = "not installed on this machine";
+      }
     }
     const consoleHost =
       entry.consoleHost !== null ? entry.consoleHost : template && template.consoleHost ? template.consoleHost : null;
-    if (!reason && consoleHost && !consoleHostExecutable) {
-      reason = 'needs "' + consoleHost + '" to open a console window, and it is not installed';
+    if (!reason && consoleHost) {
+      const hostTool = toolById(consoleHost, platform);
+      const host = hostTool ? locateTool(hostTool, context) : null;
+      if (!host) reason = 'needs "' + consoleHost + '" to open a console window, and it is not installed';
     }
 
     entries.push({
@@ -378,11 +646,13 @@ function resolveToolEntries(raw, context) {
       label,
       labelText: entry.label,
       builtin: entry.builtin,
+      platform,
       enabled: entry.enabled,
       executable,
       executableOverride: entry.executable,
       executableName: executable ? path.basename(executable) : null,
       args: entry.args,
+      variant,
       consoleHost,
       status: !entry.enabled ? "disabled" : reason ? "missing" : "ready",
       reason
@@ -393,21 +663,21 @@ function resolveToolEntries(raw, context) {
 
 // What the setting currently holds; `null` means the built-in defaults.
 let storedToolSetting = null;
-let toolState = { at: 0, signature: "", entries: [], tools: [], skipped: [] };
+let toolState = { at: 0, signature: "", platform: HOST_PLATFORM, entries: [], tools: [], skipped: [] };
 
 function toolConfigSignature(raw) {
   return raw === null || raw === undefined ? "default" : JSON.stringify(raw);
 }
 
 function resetDetectionCache() {
-  toolState = { at: 0, signature: "", entries: [], tools: [], skipped: [] };
+  toolState = { at: 0, signature: "", platform: HOST_PLATFORM, entries: [], tools: [], skipped: [] };
 }
 
 // Resolve the configured list against this machine, cached in memory only.
 function resolveConfiguredTools(overrides, force) {
   const context = makeContext(overrides);
-  const raw = storedToolSetting === null ? defaultToolEntries() : storedToolSetting;
-  const signature = toolConfigSignature(raw);
+  const raw = storedToolSetting === null ? defaultToolEntries(context.platform) : storedToolSetting;
+  const signature = context.platform + "|" + toolConfigSignature(raw);
   const now = context.now();
   if (!force && toolState.at > 0 && toolState.signature === signature && now - toolState.at < DETECTION_TTL_MS) {
     return toolState;
@@ -416,6 +686,7 @@ function resolveConfiguredTools(overrides, force) {
   toolState = {
     at: now,
     signature,
+    platform: context.platform,
     entries: resolved.entries,
     tools: resolved.entries
       .filter((entry) => entry.status === "ready")
@@ -617,13 +888,15 @@ async function loadToolConfig(overrides) {
 
 // The shape the settings UI renders and posts back.
 function configPayload(state, locale, project, file) {
+  const platform = state.platform || HOST_PLATFORM;
   return {
     ok: true,
     file: file || null,
     locale,
+    platform,
     project: project ? project.path : null,
     entries: state.entries.map((entry) => {
-      const template = entry.builtin ? toolById(entry.id) : null;
+      const template = entry.builtin ? toolById(entry.id, platform) : null;
       return {
         id: entry.id,
         label: entry.label,
@@ -636,13 +909,14 @@ function configPayload(state, locale, project, file) {
         executableName: entry.executableName,
         executableOverride: entry.executableOverride,
         args: entry.args,
-        defaultArgs: template ? template.argv(DIR_PLACEHOLDER) : null,
+        defaultArgs: template ? variantArgv(template, null, DIR_PLACEHOLDER) : null,
         consoleHost: entry.consoleHost,
         defaultConsoleHost: template ? template.consoleHost || null : null,
         stored: storedToolEntry(entry)
       };
     }),
-    builtins: builtinDefaults(locale),
+    builtins: builtinDefaults(locale, platform),
+    consoleHosts: [...consoleHostIds(platform)],
     skipped: state.skipped.map((entry) => entry.reason),
     limit: MAX_TOOLS
   };
@@ -684,20 +958,24 @@ function setLaunchOverrides(next) {
  */
 let processEnvironment = null;
 
-function defaultEnvironment() {
-  if (!processEnvironment) processEnvironment = buildChildEnvironment(process.env);
-  return processEnvironment;
+function defaultEnvironment(platform) {
+  const target = normalizePlatform(platform === undefined ? HOST_PLATFORM : platform);
+  if (!processEnvironment) processEnvironment = {};
+  if (!processEnvironment[target]) processEnvironment[target] = buildChildEnvironment(process.env, null, target);
+  return processEnvironment[target];
 }
 
 function makeContext(overrides) {
   const base = overrides || launchOverrides || {};
   const fileSystem = base.fileSystem || systemFileSystem();
+  const platform = normalizePlatform(base.platform === undefined ? HOST_PLATFORM : base.platform);
   return {
     // Whatever environment we are handed is completed first: the host's stripped
     // one in production, an injected one in the self-test. Every path this module
     // derives from the profile is then in place for both detection and launching.
-    env: base.env ? buildChildEnvironment(base.env, fileSystem) : defaultEnvironment(),
+    env: base.env ? buildChildEnvironment(base.env, fileSystem, platform) : defaultEnvironment(platform),
     fileSystem,
+    platform,
     spawn: base.spawn || spawn,
     now: base.now || Date.now
   };
@@ -737,7 +1015,9 @@ function isFile(target, fileSystem) {
  * disk. Nothing is invented that does not exist, and nothing is read from the
  * network or the registry.
  */
-function buildChildEnvironment(baseEnv, fileSystem) {
+function buildChildEnvironment(baseEnv, fileSystem, platform) {
+  const target = normalizePlatform(platform === undefined ? HOST_PLATFORM : platform);
+  if (target !== PLATFORM_WINDOWS) return buildPosixEnvironment(baseEnv);
   const env = { ...(baseEnv || process.env) };
   const probe = fileSystem && typeof fileSystem.statSync === "function" ? fileSystem : systemFileSystem();
   const directoryOnDisk = (target) => {
@@ -844,12 +1124,72 @@ function buildChildEnvironment(baseEnv, fileSystem) {
   }
   if (segments.length > 0) env.PATH = segments.join(path.delimiter);
 
+  return finishEnvironment(env);
+}
+
+/**
+ * The environment a launched tool gets on macOS and Linux.
+ *
+ * POSIX children need far less than Windows ones — a `HOME` to find their own
+ * configuration, a `USER`, a `SHELL` for the terminal emulators and a writable
+ * `TMPDIR` — and they must *not* be handed the Windows-only variables
+ * (`OS`, `PATHEXT`, `ComSpec`, `ProgramFiles`, …): a program that reads `OS`
+ * would conclude it is running on Windows NT.
+ */
+function buildPosixEnvironment(baseEnv) {
+  const env = { ...(baseEnv || process.env) };
+  const has = (key) => typeof env[key] === "string" && env[key].trim().length > 0;
+
+  let home = has("HOME") ? env.HOME : "";
+  if (!home) {
+    try {
+      home = os.homedir();
+    } catch {
+      home = "";
+    }
+  }
+  if (home) env.HOME = home;
+  if (!has("TMPDIR")) {
+    for (const candidate of ["/tmp", "/var/tmp"]) {
+      if (isDirectory(candidate, systemFileSystem())) {
+        env.TMPDIR = candidate;
+        break;
+      }
+    }
+  }
+  if (!has("SHELL")) {
+    for (const candidate of ["/bin/zsh", "/bin/bash", "/bin/sh"]) {
+      if (isFile(candidate, systemFileSystem())) {
+        env.SHELL = candidate;
+        break;
+      }
+    }
+  }
+  if (!has("USER") && has("USERNAME")) env.USER = env.USERNAME;
+  if (!has("USER") && !has("LOGNAME")) {
+    try {
+      const name = os.userInfo().username;
+      if (name) env.USER = name;
+    } catch {
+      /* left unset */
+    }
+  }
+  if (!has("LOGNAME") && has("USER")) env.LOGNAME = env.USER;
+
+  // The Windows-only names have no meaning here, and the register/launch code
+  // never reads them: drop them instead of passing them on.
+  for (const key of WINDOWS_ONLY_ENV_KEYS) delete env[key];
+
+  return finishEnvironment(env);
+}
+
+/** Drop the host's own markers and every empty value a child should not see. */
+function finishEnvironment(env) {
   // The host runs this plugin process as Node inside PI-Desktop, so the process
   // carries ELECTRON_RUN_AS_NODE=1 plus the host's own markers. Handing those to
   // a child makes any Electron-based tool (VS Code, Cursor, …) start as Node and
   // exit without a window — which is exactly "I clicked and nothing happened".
   for (const key of HOST_ONLY_ENV_KEYS) delete env[key];
-
   for (const key of Object.keys(env)) {
     if (typeof env[key] !== "string" || env[key].length === 0) delete env[key];
   }
@@ -873,18 +1213,42 @@ function searchDirectories(env) {
     .filter(Boolean);
 }
 
-/** The absolute path of a tool's executable on this machine, or null. */
-function resolveExecutable(tool, context) {
-  for (const candidate of tool.candidates(context.env)) {
-    if (isFile(candidate, context.fileSystem)) return candidate;
-  }
-  for (const directory of searchDirectories(context.env)) {
-    for (const name of tool.executableNames) {
-      const candidate = path.join(directory, name);
-      if (isFile(candidate, context.fileSystem)) return candidate;
+/**
+ * Where a tool is on this machine, as `{ executable, variant }`, or null.
+ *
+ * Variants are tried best first. A variant that declares `needs` is only usable
+ * when at least one of those paths exists — that is how a macOS app is found
+ * when the launcher itself is always the same `open` binary.
+ */
+function locateTool(tool, context) {
+  if (!tool || !Array.isArray(tool.variants)) return null;
+  for (let index = 0; index < tool.variants.length; index += 1) {
+    const variant = tool.variants[index];
+    const needed = typeof variant.needs === "function" ? variant.needs(context.env) : null;
+    if (Array.isArray(needed) && needed.length > 0) {
+      const present = needed.some(
+        (target) => isFile(target, context.fileSystem) || isDirectory(target, context.fileSystem)
+      );
+      if (!present) continue;
+    }
+    const candidates = typeof variant.candidates === "function" ? variant.candidates(context.env) : [];
+    for (const candidate of candidates) {
+      if (isFile(candidate, context.fileSystem)) return { executable: candidate, variant: index };
+    }
+    for (const directory of searchDirectories(context.env)) {
+      for (const name of variant.executableNames || []) {
+        const candidate = path.join(directory, name);
+        if (isFile(candidate, context.fileSystem)) return { executable: candidate, variant: index };
+      }
     }
   }
   return null;
+}
+
+/** The absolute path of a tool's executable on this machine, or null. */
+function resolveExecutable(tool, context) {
+  const found = locateTool(tool, context);
+  return found ? found.executable : null;
 }
 
 /** Where in argv the project folder rides: an element, or the tail of an option. */
@@ -919,16 +1283,16 @@ function buildLaunch(toolId, root, overrides) {
   let spawnArgv = argv;
   let consoleHost = null;
   if (entry.consoleHost) {
-    const host = toolById(entry.consoleHost);
-    const hostExecutable = host ? resolveExecutable(host, context) : null;
-    if (!hostExecutable) {
+    const host = toolById(entry.consoleHost, entry.platform);
+    const found = host ? locateTool(host, context) : null;
+    if (!found) {
       throw pluginError(
         "CONSOLE_HOST_MISSING",
         entry.id + " needs " + entry.consoleHost + " to open a console window, and it is not installed"
       );
     }
     consoleHost = host.id;
-    spawnExecutable = hostExecutable;
+    spawnExecutable = found.executable;
     spawnArgv = [executable, ...argv];
   }
   const dirIndex = argvDirectoryIndex(argv, target);
@@ -943,7 +1307,7 @@ function buildLaunch(toolId, root, overrides) {
     spawnArgv,
     options: {
       cwd: target,
-      env: buildChildEnvironment(context.env, context.fileSystem),
+      env: buildChildEnvironment(context.env, context.fileSystem, context.platform),
       shell: false,
       detached: true,
       stdio: "ignore",
@@ -1089,7 +1453,7 @@ const HANDLERS = {
     if (entries.length > MAX_TOOLS) {
       return { ok: false, error: "INVALID_CONFIG", message: "at most " + MAX_TOOLS + " tools can be configured" };
     }
-    const normalized = normalizeToolEntries(entries);
+    const normalized = normalizeToolEntries(entries, makeContext().platform);
     if (normalized.skipped.length > 0) {
       return {
         ok: false,
@@ -1220,19 +1584,37 @@ module.exports = {
     DIR_PLACEHOLDER,
     MAX_TOOLS,
     TOOLS,
+    TOOL_TABLES,
+    WINDOWS_TOOLS,
+    MACOS_TOOLS,
+    LINUX_TOOLS,
+    PLATFORMS,
+    PLATFORM_WINDOWS,
+    PLATFORM_MACOS,
+    PLATFORM_LINUX,
+    HOST_PLATFORM,
+    normalizePlatform,
+    toolTable,
+    toolById,
+    builtinIds,
+    consoleHostIds,
     defaultToolEntries,
     builtinDefaults,
     normalizeToolEntry,
     normalizeToolEntries,
     storedToolEntry,
+    entryArgv,
+    variantArgv,
     resolveToolEntries,
     resolveConfiguredTools,
     detectTools,
     toolEntries,
     resetDetectionCache,
+    locateTool,
     resolveExecutable,
     buildLaunch,
     buildChildEnvironment,
+    buildPosixEnvironment,
     defaultEnvironment,
     launchTool,
     loadToolConfig,

@@ -146,11 +146,15 @@ function stubPi(options) {
 }
 
 function fakeFileSystem(files, directories) {
-  const fileSet = new Set((files || []).map((entry) => String(entry).toLowerCase()));
-  const directorySet = new Set((directories || []).map((entry) => String(entry).toLowerCase()));
+  // Paths are compared with one separator and one case, so the same stub works
+  // for the Windows table (backslashes) and the macOS/Linux ones (slashes),
+  // whichever host runs this test.
+  const normalize = (entry) => String(entry).toLowerCase().replace(/\\/g, "/");
+  const fileSet = new Set((files || []).map(normalize));
+  const directorySet = new Set((directories || []).map(normalize));
   return {
     statSync(target) {
-      const key = String(target).toLowerCase();
+      const key = normalize(target);
       if (fileSet.has(key)) return { isFile: () => true, isDirectory: () => false };
       if (directorySet.has(key)) return { isFile: () => false, isDirectory: () => true };
       const error = new Error("ENOENT: no such file or directory, stat '" + target + "'");
@@ -341,13 +345,14 @@ function resolvedRoot() {
   const root = resolvedRoot();
   const spaced = join(root, "a folder with spaces & symbols");
   for (const tool of internals.TOOLS) {
-    const first = tool.argv(root);
-    const second = tool.argv(root);
+    const first = internals.variantArgv(tool, 0, root);
+    const second = internals.variantArgv(tool, 0, root);
     check(`${tool.id}: argv is an array of strings`, Array.isArray(first) && first.every((entry) => typeof entry === "string"));
     check(`${tool.id}: argv is deterministic across calls`, JSON.stringify(first) === JSON.stringify(second), JSON.stringify(first));
     const carriers = first.filter((entry) => entry.includes(root));
     check(`${tool.id}: the project folder travels in exactly one argv element`, carriers.length === 1, JSON.stringify(first));
-    if (tool.argvTarget === "option") {
+    const argvTarget = first[first.length - 1] === root ? "last" : first.some((entry) => entry.endsWith("=" + root)) ? "option" : "none";
+    if (argvTarget === "option") {
       check(
         `${tool.id}: the folder is the tail of the last element (only form git-bash.exe accepts)`,
         first[first.length - 1] === "--cd=" + root,
@@ -356,7 +361,7 @@ function resolvedRoot() {
     } else {
       check(`${tool.id}: the last argv element is the resolved project folder`, first[first.length - 1] === root, JSON.stringify(first));
     }
-    const spacedArgv = tool.argv(spaced);
+    const spacedArgv = internals.variantArgv(tool, 0, spaced);
     check(
       `${tool.id}: a folder with spaces is passed through unquoted, unmangled`,
       spacedArgv.some((entry) => entry.includes(spaced)),
@@ -1356,6 +1361,301 @@ function resolvedRoot() {
       /* leaving a temp directory behind must not fail the run */
     }
   }
+}
+
+// ----------------------------------------------------------------------------
+// 8. the other platforms: macOS and Linux tables, detection, launching, the
+//    child environment and the settings payload. Everything here runs against a
+//    stubbed file system and a stubbed spawn — these are structural assertions,
+//    they do not claim a real macOS or Linux launch was observed.
+// ----------------------------------------------------------------------------
+{
+  internals.setLaunchOverrides(null);
+  const MAC_OPEN = "/usr/bin/open";
+  const MAC_CODE = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
+  const MAC_VSCODE_APP = "/Applications/Visual Studio Code.app";
+  const MAC_TERMINAL_APP = "/System/Applications/Utilities/Terminal.app";
+  const MAC_PROJECT = "/Users/tester/a project";
+  // The folder is resolved by the host platform's `path` module, so the
+  // assertions compare against that resolution rather than the literal.
+  const MAC_ROOT = resolve(MAC_PROJECT);
+
+  check("an unknown platform name counts as Linux", internals.normalizePlatform("freebsd") === "linux");
+  check("a known platform name is kept", internals.normalizePlatform("darwin") === "darwin");
+  check("no platform name falls back to this machine", internals.normalizePlatform("") === internals.HOST_PLATFORM);
+
+  for (const platform of internals.PLATFORMS) {
+    const table = internals.toolTable(platform);
+    const ids = table.map((tool) => tool.id);
+    check(`${platform}: ships at least one built-in tool`, table.length > 0, String(table.length));
+    check(`${platform}: tool ids are unique`, new Set(ids).size === ids.length, ids.join(", "));
+    for (const tool of table) {
+      check(`${platform}/${tool.id}: has at least one variant`, Array.isArray(tool.variants) && tool.variants.length > 0);
+      check(
+        `${platform}/${tool.id}: every variant can be located and started`,
+        tool.variants.every(
+          (variant) =>
+            typeof variant.argv === "function" &&
+            (Array.isArray(variant.executableNames) || typeof variant.candidates === "function")
+        )
+      );
+      check(
+        `${platform}/${tool.id}: is labelled in both locales`,
+        Boolean(tool.label && tool.label.en && tool.label["zh-CN"])
+      );
+      for (let index = 0; index < tool.variants.length; index += 1) {
+        const argv = internals.variantArgv(tool, index, MAC_PROJECT);
+        check(
+          `${platform}/${tool.id}#${index}: argv is an array of strings`,
+          Array.isArray(argv) && argv.every((entry) => typeof entry === "string"),
+          JSON.stringify(argv)
+        );
+        const carriers = argv.filter((entry) => entry.includes(MAC_PROJECT));
+        check(
+          `${platform}/${tool.id}#${index}: the folder travels in exactly one argv element`,
+          carriers.length === 1,
+          JSON.stringify(argv)
+        );
+        check(
+          `${platform}/${tool.id}#${index}: the folder is not glued into a command line`,
+          argv.every((entry) => entry === MAC_PROJECT || !entry.includes(" " + MAC_PROJECT) || entry.endsWith("=" + MAC_PROJECT)),
+          JSON.stringify(argv)
+        );
+      }
+    }
+  }
+
+  check(
+    "Windows keeps the eight documented tools",
+    JSON.stringify(internals.toolTable("win32").map((tool) => tool.id)) ===
+      JSON.stringify(["vscode", "explorer", "cmd", "powershell", "pwsh", "gitbash", "wt", "wsl"])
+  );
+  check(
+    "macOS offers VS Code, Finder, Terminal and iTerm2",
+    JSON.stringify(internals.toolTable("darwin").map((tool) => tool.id)) ===
+      JSON.stringify(["vscode", "finder", "terminal", "iterm"])
+  );
+  check(
+    "Linux offers VS Code, the file manager and a terminal",
+    JSON.stringify(internals.toolTable("linux").map((tool) => tool.id)) === JSON.stringify(["vscode", "filemanager", "terminal"])
+  );
+  check(
+    "Windows Terminal is the only console host, and only on Windows",
+    internals.consoleHostIds("win32").size === 1 &&
+      internals.consoleHostIds("win32").has("wt") &&
+      internals.consoleHostIds("darwin").size === 0 &&
+      internals.consoleHostIds("linux").size === 0
+  );
+
+  // -- detection against a stubbed macOS disk
+  const macEnv = { HOME: "/Users/tester", PATH: "/usr/bin:/bin" };
+  internals.resetDetectionCache();
+  const macDetected = internals.detectTools({
+    platform: "darwin",
+    env: macEnv,
+    fileSystem: fakeFileSystem([MAC_OPEN, MAC_CODE], [MAC_VSCODE_APP, MAC_TERMINAL_APP])
+  });
+  const macIds = macDetected.map((tool) => tool.id);
+  check(
+    "macOS: VS Code, Finder and Terminal are detected; iTerm2 is not",
+    JSON.stringify(macIds) === JSON.stringify(["vscode", "finder", "terminal"]),
+
+    macIds.join(", ")
+  );
+  check(
+    "macOS: the VS Code command line is preferred when it exists",
+    (macDetected.find((tool) => tool.id === "vscode") || {}).executable === MAC_CODE
+  );
+
+  internals.resetDetectionCache();
+  const macLaunch = internals.buildLaunch("terminal", MAC_PROJECT, {
+    platform: "darwin",
+    env: macEnv,
+    fileSystem: fakeFileSystem([MAC_OPEN], [MAC_TERMINAL_APP])
+  });
+  check(
+    "macOS: Terminal is started through LaunchServices on the folder",
+    macLaunch.executable === MAC_OPEN &&
+      JSON.stringify(macLaunch.argv) === JSON.stringify(["-a", "Terminal", MAC_ROOT]),
+    JSON.stringify(macLaunch.argv)
+  );
+  check("macOS: the launch goes through no shell", macLaunch.options.shell === false);
+  check("macOS: the launch opens in the project folder", macLaunch.options.cwd === MAC_ROOT, macLaunch.options.cwd);
+  check(
+    "macOS: the folder rides in the last argv element",
+    macLaunch.argvTarget === "last" && macLaunch.dirIndex === macLaunch.argv.length - 1,
+    JSON.stringify([macLaunch.argvTarget, macLaunch.dirIndex])
+  );
+  check("macOS: no console host is involved", macLaunch.consoleHost === null);
+
+  const macSpawned = [];
+  internals.resetDetectionCache();
+  const macResult = internals.launchTool("finder", MAC_PROJECT, {
+    platform: "darwin",
+    env: macEnv,
+    fileSystem: fakeFileSystem([MAC_OPEN]),
+    spawn: (command, argv, options) => {
+      macSpawned.push({ command, argv, options });
+      return { pid: 4242, unref() {} };
+    }
+  });
+  check(
+    "macOS: opening Finder spawns `open <folder>` exactly once",
+    macSpawned.length === 1 &&
+      macSpawned[0].command === MAC_OPEN &&
+      JSON.stringify(macSpawned[0].argv) === JSON.stringify([MAC_ROOT]),
+    JSON.stringify(macSpawned)
+  );
+  check("macOS: the launched process id is reported back", macResult.pid === 4242, String(macResult.pid));
+  check(
+    "macOS: the child environment is POSIX, not Windows",
+    macSpawned[0].options.env.HOME === "/Users/tester" &&
+      macSpawned[0].options.env.OS === undefined &&
+      macSpawned[0].options.env.PATHEXT === undefined,
+    JSON.stringify({ HOME: macSpawned[0].options.env.HOME, OS: macSpawned[0].options.env.OS })
+  );
+
+  // -- detection against a stubbed Linux disk
+  const linuxEnv = { HOME: "/home/tester", PATH: "/usr/bin:/bin" };
+  internals.resetDetectionCache();
+  const linuxDetected = internals.detectTools({
+    platform: "linux",
+    env: linuxEnv,
+    fileSystem: fakeFileSystem(["/usr/bin/code", "/usr/bin/xdg-open", "/usr/bin/konsole", "/usr/bin/gnome-terminal"])
+  });
+  const linuxTerminal = linuxDetected.find((tool) => tool.id === "terminal") || {};
+  check(
+    "Linux: the first terminal emulator of the table wins",
+    linuxTerminal.executable === "/usr/bin/gnome-terminal",
+    String(linuxTerminal.executable)
+  );
+  internals.resetDetectionCache();
+  const linuxLaunch = internals.buildLaunch("terminal", "/home/tester/project", {
+    platform: "linux",
+    env: linuxEnv,
+    fileSystem: fakeFileSystem(["/usr/bin/gnome-terminal", "/usr/bin/konsole"])
+  });
+  check(
+    "Linux: the terminal is told the folder as its working directory",
+    JSON.stringify(linuxLaunch.argv) === JSON.stringify(["--working-directory", resolve("/home/tester/project")]),
+    JSON.stringify(linuxLaunch.argv)
+  );
+  internals.resetDetectionCache();
+  const codeOnlyOnPath = internals.detectTools({
+    platform: "linux",
+    env: { HOME: "/home/tester", PATH: "/opt/tools/bin" },
+    fileSystem: fakeFileSystem(["/opt/tools/bin/code"])
+  });
+  check(
+    "Linux: VS Code is also found through PATH",
+    String((codeOnlyOnPath.find((tool) => tool.id === "vscode") || {}).executable || "")
+      .split(String.fromCharCode(92))
+      .join("/") === "/opt/tools/bin/code",
+    String(JSON.stringify((codeOnlyOnPath.find((tool) => tool.id === "vscode") || {}).executable || "")),
+    JSON.stringify(codeOnlyOnPath.map((tool) => tool.id))
+  );
+
+  // -- validation is per platform
+  const macCustom = internals.normalizeToolEntries(
+    [{ id: "editor", executable: "/usr/local/bin/code", args: ["{dir}"] }],
+    "darwin"
+  );
+  check(
+    "macOS: a custom program without a .exe is accepted",
+    macCustom.entries.length === 1 && macCustom.skipped.length === 0,
+    JSON.stringify(macCustom.skipped)
+  );
+  const linuxCustom = internals.normalizeToolEntries(
+    [{ id: "editor", executable: "/usr/bin/gedit", args: ["{dir}"] }],
+    "linux"
+  );
+  check("Linux: a custom program without a .exe is accepted", linuxCustom.entries.length === 1);
+  const windowsCustom = internals.normalizeToolEntries(
+    [{ id: "editor", executable: "C:/Tools/editor", args: ["{dir}"] }],
+    "win32"
+  );
+  check(
+    "Windows: a custom program without .exe is still rejected",
+    windowsCustom.entries.length === 0 && typeof windowsCustom.skipped[0].reason === "string",
+    JSON.stringify(windowsCustom.skipped)
+  );
+  const macHost = internals.normalizeToolEntries(
+    [{ id: "editor", executable: "/usr/local/bin/code", args: ["{dir}"], consoleHost: "wt" }],
+    "darwin"
+  );
+  check(
+    "macOS: a Windows console host is refused with a reason",
+    macHost.entries.length === 0 && typeof macHost.skipped[0].reason === "string",
+    JSON.stringify(macHost.skipped)
+  );
+
+  // -- the child environment, per platform
+  const posixChild = internals.buildChildEnvironment(
+    {
+      HOME: "/Users/tester",
+      PATH: "/usr/bin:/bin",
+      OS: "Windows_NT",
+      PATHEXT: ".EXE",
+      ComSpec: "C:/Windows/System32/cmd.exe",
+      USERPROFILE: "C:/Users/tester",
+      LOCALAPPDATA: "C:/Users/tester/AppData/Local",
+      ELECTRON_RUN_AS_NODE: "1"
+    },
+    null,
+    "darwin"
+  );
+  check("macOS: the child keeps HOME", posixChild.HOME === "/Users/tester", String(posixChild.HOME));
+  check(
+    "macOS: the child never sees the Windows-only variables",
+    posixChild.OS === undefined &&
+      posixChild.PATHEXT === undefined &&
+      posixChild.ComSpec === undefined &&
+      posixChild.USERPROFILE === undefined &&
+      posixChild.LOCALAPPDATA === undefined,
+    JSON.stringify(Object.keys(posixChild))
+  );
+  check("macOS: the child never sees the host markers", posixChild.ELECTRON_RUN_AS_NODE === undefined);
+  check(
+    "macOS: the child gets a user name it can work with",
+    typeof posixChild.USER === "string" && posixChild.USER.length > 0,
+    String(posixChild.USER)
+  );
+  check("macOS: LOGNAME mirrors USER", posixChild.LOGNAME === posixChild.USER, String(posixChild.LOGNAME));
+  check(
+    "Windows: the same call still fills in the Windows variables",
+    internals.buildChildEnvironment({ USERPROFILE: "C:/Users/tester" }, null, "win32").OS === "Windows_NT"
+  );
+
+  // -- the settings payload tells the renderer which platform it is on
+  const macPayload = internals.configPayload(
+    { platform: "darwin", entries: [], skipped: [], tools: [] },
+    "en",
+    null,
+    null
+  );
+  check("the settings sheet is told the platform", macPayload.platform === "darwin", String(macPayload.platform));
+  check(
+    "the settings sheet is told there is no console host on macOS",
+    Array.isArray(macPayload.consoleHosts) && macPayload.consoleHosts.length === 0,
+    JSON.stringify(macPayload.consoleHosts)
+  );
+  check(
+    "the settings sheet offers the macOS built-ins",
+    JSON.stringify(macPayload.builtins.map((builtin) => builtin.id)) ===
+      JSON.stringify(["vscode", "finder", "terminal", "iterm"]),
+    JSON.stringify(macPayload.builtins.map((builtin) => builtin.id))
+  );
+  const winPayload = internals.configPayload(
+    { platform: "win32", entries: [], skipped: [], tools: [] },
+    "en",
+    null,
+    null
+  );
+  check(
+    "the settings sheet offers Windows Terminal as the console host",
+    JSON.stringify(winPayload.consoleHosts) === JSON.stringify(["wt"]),
+    JSON.stringify(winPayload.consoleHosts)
+  );
 }
 
 // ----------------------------------------------------------------------------

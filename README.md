@@ -3,13 +3,16 @@
 在 PI-Desktop 的**输入框工具栏**放一个按钮：点开下拉菜单，用本机已安装的外部工具打开**当前项目文件夹**。
 装了哪些工具就列哪些，没装的不出现、也不会有「点了没反应」的条目。
 
-- 工具集合：VS Code、资源管理器、命令提示符 (cmd)、Windows PowerShell、PowerShell 7、Git Bash、Windows 终端 (wt)、WSL
+- 工具集合（按平台，装了哪几个就列哪几个）：
+  - Windows：VS Code、资源管理器、命令提示符 (cmd)、Windows PowerShell、PowerShell 7、Git Bash、Windows 终端 (wt)、WSL
+  - macOS：VS Code（命令行优先，没装命令行时用 `open -a` 走应用本体）、访达、终端、iTerm2
+  - Linux：VS Code、文件管理器（`xdg-open`）、终端模拟器（`gnome-terminal` / `konsole` / `xfce4-terminal`）
 - 目标路径：当前项目根目录（同时作为子进程的工作目录）
 - 启动失败会弹通知（`notify` 权限），不会静默失败
 - 没有打开项目时按钮置灰，悬停提示给出原因
 - 双击/回车打开菜单，方向键移动，Esc 或点空白处关闭
 
-版本 `0.4.2`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en）。
+版本 `0.5.0`，manifest 为 `schemaVersion: 1`，中英双语（zh-CN / en），Windows / macOS / Linux 三平台。
 
 > **id 变更**：0.4 之前插件的 id 是 `local.pi-open-tools`。宿主强制 id 必须含点
 > （`^[a-z0-9]+(\.[a-z0-9_-]+)+$`），所以现在叫 `mfy.pi-desktop-open-tools`，显示名不变。
@@ -29,7 +32,7 @@
 
 **方式 B：安装发布包**
 
-1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.4.2.piplug`）
+1. 先生成包：见下面「验证」里的 `scripts/pack.mjs`（产物 `dist/mfy.pi-desktop-open-tools-0.5.0.piplug`）
 2. 插件页 → 安装本地插件 → 选这个 `.piplug`
 
 两种方式都需要在**打开了项目**的会话里使用（插件把当前项目根目录作为目标）。
@@ -186,31 +189,46 @@ Select-String -Path "$env:USERPROFILE\.pi-desktop\logs\app\plugin.log" -Pattern 
 > 之后插件再也不看宿主设置。
 
 ## 扩展工具表
-所有工具都在 `main.js` 顶部的 `TOOLS` 数组里，加一项即可（探测不到就不会显示）。
-只是想多一个工具、不想改代码的话，用面板里的「＋ 添加工具」就够了（见上文「配置外部工具」）；下表是给内置项用的：
+工具表按平台分三张，都在 `main.js` 顶部：`WINDOWS_TOOLS`、`MACOS_TOOLS`、`LINUX_TOOLS`。
+加一项即可（探测不到就不会显示）；只是想多一个工具、不想改代码的话，用面板里的「＋ 添加工具」就够了。
+
+一个工具由若干 **variant** 组成，按优先级排列 —— 每一种「怎么找到它、怎么启动它」是一个 variant：
 
 ```js
 {
   id: "myeditor",
   label: { en: "My Editor", "zh-CN": "我的编辑器" },
-  executableNames: ["MyEditor.exe"],                       // PATH 上找这些文件名
-  candidates: (env) => [                                    // 固定安装位置，先查这些
-    path.join(env.LOCALAPPDATA || "", "Programs", "MyEditor", "MyEditor.exe")
-  ],
-  argv: (root) => [root]                                    // 目标目录作为最后一个参数
+  variants: [
+    {
+      executableNames: ["myeditor", "MyEditor.exe"],          // 在 PATH 上找这些文件名
+      candidates: (env) => [                                  // 固定安装位置，先查这些
+        path.join(env.LOCALAPPDATA || "", "Programs", "MyEditor", "MyEditor.exe")
+      ],
+      argv: (root) => [root]                                  // 目标目录作为最后一个参数
+    },
+    {
+      // 启动器是固定程序、可用性取决于另一个路径时（macOS 的 open -a 就是这样）
+      candidates: () => ["/usr/bin/open"],
+      needs: () => ["/Applications/My Editor.app"],           // 至少要存在一个
+      argv: (root) => ["-a", "My Editor", root]
+    }
+  ]
 }
 ```
 
 约定与边界：
 
-- `argv(root)` 必须把项目目录放在**恰好一个**元素里，并且（除下面 Git Bash 这种特例外）是**最后**一个元素。
+- `argv(root)` 必须把项目目录放在**恰好一个**元素里，并且是**最后**一个元素。
+  唯一例外是 Git Bash：它只认 `--cd=<目录>`（裸目录会被它当成要执行的程序），目录因此在选项元素里。
+- `path` 是宿主进程自己的 path 模块。同一个字符串在 Windows 进程和 macOS/Linux 进程里含义不同，
+  所以每条路径写进它所属的那张表，不要在一张表里混两种风格。
 - 启动永远是 `spawn(可执行文件, argv, { shell: false, cwd: root, detached: true, stdio: "ignore", env: 补全后的环境 })`：
   不经 shell、不拼命令行、不把路径塞进字符串命令里。
-- 需要控制台窗口的 shell（cmd / Windows PowerShell / PowerShell 7）要声明 `consoleHost: "wt"`：
-  见下面「为什么 shell 要经过 Windows 终端」。GUI 程序（VS Code、资源管理器）与自带启动器的
-  工具（`git-bash.exe`、`wt.exe`、`wsl.exe`）不需要它。
+- 需要控制台窗口的 shell（cmd / Windows PowerShell / PowerShell 7）只在 Windows 上存在，声明 `consoleHost: "wt"`
+  交给 Windows 终端开窗（见下一节）。macOS/Linux 没有这个概念：工具都是直接启动的。
 - 探测只看固定安装位置与 PATH 上已有的目录，不递归遍历、不写缓存（内存里缓存 1 分钟）。
-- 只接受 `.exe`（真实可执行文件或 Windows 应用执行别名）。`code.cmd` 这类脚本**不**收：启动它们就得过 shell。
+- 可执行文件规则按平台：Windows 必须 `.exe`（真实可执行文件或 Windows 应用执行别名，`.cmd` 这类脚本**不**收，
+  启动它们就得过 shell）；macOS/Linux 接受任意绝对路径。
 - 新工具**不需要**新权限：插件只申请 `renderer.extension`（一个工具栏按钮）和 `notify`（失败通知）。
 
 ## 为什么 shell 要经过 Windows 终端
@@ -258,6 +276,28 @@ Select-String -Path "$env:USERPROFILE\.pi-desktop\logs\app\plugin.log" -Pattern 
 断言 VS Code 仍被探测到；断言补全后的 env 里有 `LOCALAPPDATA`/`APPDATA`/`USERNAME`/`ComSpec`/`PATHEXT`；
 断言 `ELECTRON_RUN_AS_NODE` 不会传给子进程。
 
+## 跨平台怎么做的
+
+三张表 + 一次平台归一化，逻辑里没有一个 `if (process.platform)`：
+
+| 位置 | 作用 |
+| --- | --- |
+| `normalizePlatform()` | 只认 `win32` / `darwin` / `linux`；其他 POSIX 系统（BSD 等）一律按 `linux` |
+| `toolTable()` / `toolById()` / `builtinIds()` / `consoleHostIds()` | 所有「这个平台有哪些工具」都从这里问 |
+| `locateTool(tool, context)` | 按 variant 顺序找可执行文件，返回 `{ executable, variant }`；`needs` 不满足就跳过该 variant |
+| `variantArgv(tool, variant, root)` | 命中那个 variant 的命令行 |
+| `buildChildEnvironment(env, fs, platform)` | Windows 补全标准变量；macOS/Linux 补 `HOME`/`USER`/`LOGNAME`/`SHELL`/`TMPDIR`，并剔除 `OS=Windows_NT`、`PATHEXT`、`ComSpec` 等 Windows 专有变量 |
+| 可执行文件校验 | Windows 要求 `.exe`；macOS/Linux 接受任意绝对路径 |
+
+配置面板也按平台走：`toolConfig` 的返回里带 `platform` 与 `consoleHosts`，渲染器据此换占位符文案
+（`C:\path\to\tool.exe` / `…/Contents/MacOS/…` / `/usr/bin/…`），并在非 Windows 上**不显示**
+「需要控制台窗口」这个勾选项 —— 那里没有这个概念。
+
+**验证边界（重要）**：Windows 上的每条路径都是真机验证过的。macOS 与 Linux 的代码路径由
+`scripts/selftest.mjs` 用桩文件系统 + 桩 spawn 做结构性断言（表的完整性、argv 形状、探测优先顺序、
+校验规则、子进程环境），**没有**在真机上跑过真实启动 —— 开发机上只有 Windows。
+第一次在 macOS/Linux 上安装时，请把它当作「需要你自己确认一次」。
+
 ## 设计说明与已知边界
 
 - **manifest 的 `author` 必须是字符串**：`PluginCheck`（JS 规则）允许 `{ "name": … }`，但宿主安装器用更严格的结构校验，
@@ -302,7 +342,7 @@ Select-String -Path "$env:USERPROFILE\.pi-desktop\logs\app\plugin.log" -Pattern 
 | `manifest.json` | 插件清单（id / 权限 / 渲染器 / 渲染器白名单 / 中英双语；不声明任何设置项） |
 | `main.js` | 插件主进程：环境补全、工具探测、可配置工具表（校验/合并/解析）、`tools.json` 读写、`plugin.call` 处理器、`spawn` 启动 |
 | `renderer/index.mjs` | 渲染器模块：`composerControl` 按钮 + 下拉菜单 + 配置面板（纯 DOM，无 JSX、无构建） |
-| `scripts/selftest.mjs` | 离线自测（桩宿主、桩 react，277 条断言） |
+| `scripts/selftest.mjs` | 离线自测（桩宿主、桩 react、桩文件系统，416 条断言） |
 | `scripts/verify-manifest.mjs` | manifest 规则校验（同宿主安装器规则，79 条断言） |
 | `scripts/pack.mjs` | 生成 store-only `.piplug`（只采集 manifest 引用的运行时文件） |
 | `scripts/verify-package.mjs` | 发布包校验：结构/CRC/路径/体积 + 包内条目集合 == manifest 引用集合 + 动态代码扫描（同 SEC003 口径） |

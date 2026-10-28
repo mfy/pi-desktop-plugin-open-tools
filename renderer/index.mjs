@@ -42,9 +42,11 @@ const TEXT = {
     configRemove: "Remove",
     configName: "Name",
     configNameHint: "Shown in the menu",
-    configExecutable: "Program (.exe)",
+    configExecutable: "Program",
     configExecutableHint: "Absolute path. Leave empty to use the copy found on this machine.",
     configExecutablePlaceholder: "C:\\path\\to\\tool.exe",
+    configExecutablePlaceholderMacos: "/Applications/Your Tool.app/Contents/MacOS/your-tool",
+    configExecutablePlaceholderLinux: "/usr/bin/your-tool",
     configFound: "found automatically",
     configNotFound: "not found",
     configArgs: "Arguments",
@@ -100,9 +102,11 @@ const TEXT = {
     configRemove: "移除",
     configName: "名称",
     configNameHint: "显示在菜单里的名字",
-    configExecutable: "程序（.exe）",
+    configExecutable: "程序",
     configExecutableHint: "绝对路径；留空表示使用本机自动探测到的那个。",
     configExecutablePlaceholder: "C:\\路径\\工具.exe",
+    configExecutablePlaceholderMacos: "/Applications/你的工具.app/Contents/MacOS/你的工具",
+    configExecutablePlaceholderLinux: "/usr/bin/你的工具",
     configFound: "已自动探测到",
     configNotFound: "未找到",
     configArgs: "参数",
@@ -1059,7 +1063,23 @@ function adoptConfig(payload) {
   configState.project = (payload && payload.project) || null;
   configState.limit = (payload && payload.limit) || 32;
   configState.file = (payload && payload.file) || null;
+  configState.platform = (payload && payload.platform) || null;
+  configState.consoleHosts = Array.isArray(payload && payload.consoleHosts) ? payload.consoleHosts.slice() : [];
   return configState;
+}
+
+/** The placeholder the program field shows, per platform. */
+function executablePlaceholder(copy) {
+  const platform = configState ? configState.platform : null;
+  if (platform === "darwin") return copy.configExecutablePlaceholderMacos;
+  if (platform === "linux") return copy.configExecutablePlaceholderLinux;
+  return copy.configExecutablePlaceholder;
+}
+
+/** The label of the program field: Windows calls it a .exe, the others do not. */
+function executableLabel(copy) {
+  const platform = configState ? configState.platform : null;
+  return platform === "darwin" || platform === "linux" ? copy.configExecutable : copy.configExecutable + " (.exe)";
 }
 
 function closeConfig() {
@@ -1106,6 +1126,8 @@ async function openConfig() {
     add: { kind: "", label: "", executable: "", args: DIR_PLACEHOLDER, consoleHost: false },
     adding: false,
     file: null,
+    platform: null,
+    consoleHosts: [],
     view: null,
     keydown: null
   };
@@ -1148,14 +1170,14 @@ function renderDetail(entry) {
     class: "ot-input",
     type: "text",
     value: entry.executableOverride,
-    placeholder: entry.executable || copy.configExecutablePlaceholder,
+    placeholder: entry.executable || executablePlaceholder(copy),
     spellcheck: "false"
   });
   executableInput.addEventListener("input", (event) => {
     entry.executableOverride = event.target.value;
   });
   const executableHint = entry.executable ? copy.configFound + " · " + entry.executable : copy.configNotFound;
-  fields.appendChild(field(copy.configExecutable, executableInput, [copy.configExecutableHint, executableHint], true));
+  fields.appendChild(field(executableLabel(copy), executableInput, [copy.configExecutableHint, executableHint], true));
 
   const argsArea = el("textarea", { class: "ot-textarea", rows: 3 });
   argsArea.value = argsText(entry);
@@ -1167,18 +1189,23 @@ function renderDetail(entry) {
   fields.appendChild(field(copy.configArgs, argsArea, argsHints, true));
   detail.appendChild(fields);
 
-  if (entry.builtin) {
-    if (entry.defaultConsoleHost) detail.appendChild(el("div", { class: "ot-field__hint", text: copy.configConsoleInfo }));
-  } else {
-    const consoleLabel = el("label", { class: "ot-check" });
-    const consoleBox = el("input", { type: "checkbox" });
-    consoleBox.checked = entry.consoleHost === "wt";
-    consoleBox.addEventListener("change", (event) => {
-      entry.consoleHost = event.target.checked ? "wt" : null;
-    });
-    consoleLabel.appendChild(consoleBox);
-    consoleLabel.appendChild(el("span", { text: copy.configConsole }));
-    detail.appendChild(consoleLabel);
+  // A console host only exists on Windows (Windows Terminal): cmd.exe cannot
+  // allocate a console window itself, so it is started inside one. Everywhere
+  // else the tool is started directly, so the control is not offered at all.
+  if (configState.consoleHosts.length > 0) {
+    if (entry.builtin) {
+      if (entry.defaultConsoleHost) detail.appendChild(el("div", { class: "ot-field__hint", text: copy.configConsoleInfo }));
+    } else {
+      const consoleLabel = el("label", { class: "ot-check" });
+      const consoleBox = el("input", { type: "checkbox" });
+      consoleBox.checked = configState.consoleHosts.includes(entry.consoleHost);
+      consoleBox.addEventListener("change", (event) => {
+        entry.consoleHost = event.target.checked ? configState.consoleHosts[0] : null;
+      });
+      consoleLabel.appendChild(consoleBox);
+      consoleLabel.appendChild(el("span", { text: copy.configConsole }));
+      detail.appendChild(consoleLabel);
+    }
   }
   return detail;
 }
@@ -1345,13 +1372,13 @@ function renderAddForm() {
       class: "ot-input",
       type: "text",
       value: form.executable,
-      placeholder: copy.configExecutablePlaceholder,
+      placeholder: executablePlaceholder(copy),
       spellcheck: "false"
     });
     exeInput.addEventListener("input", (event) => {
       form.executable = event.target.value;
     });
-    fields.appendChild(field(copy.configExecutable, exeInput));
+    fields.appendChild(field(executableLabel(copy), exeInput));
     wrap.appendChild(fields);
     wrap.appendChild(el("div", { class: "ot-field__hint", text: copy.configExecutableHint }));
 
@@ -1363,15 +1390,17 @@ function renderAddForm() {
     const argsField = field(copy.configArgs, argsArea, copy.configArgsHint, true);
     wrap.appendChild(argsField);
 
-    const consoleLabel = el("label", { class: "ot-check" });
-    const consoleBox = el("input", { type: "checkbox" });
-    consoleBox.checked = form.consoleHost === true;
-    consoleBox.addEventListener("change", (event) => {
-      form.consoleHost = event.target.checked;
-    });
-    consoleLabel.appendChild(consoleBox);
-    consoleLabel.appendChild(el("span", { text: copy.configConsole }));
-    wrap.appendChild(consoleLabel);
+    if (state.consoleHosts.length > 0) {
+      const consoleLabel = el("label", { class: "ot-check" });
+      const consoleBox = el("input", { type: "checkbox" });
+      consoleBox.checked = form.consoleHost === true;
+      consoleBox.addEventListener("change", (event) => {
+        form.consoleHost = event.target.checked;
+      });
+      consoleLabel.appendChild(consoleBox);
+      consoleLabel.appendChild(el("span", { text: copy.configConsole }));
+      wrap.appendChild(consoleLabel);
+    }
   }
 
   const actions = el("div", { class: "ot-add__row" });
@@ -1414,7 +1443,7 @@ function addFromForm() {
       executableOverride: executable,
       args: args.length > 0 ? args : [DIR_PLACEHOLDER],
       defaultArgs: null,
-      consoleHost: form.consoleHost ? "wt" : null,
+      consoleHost: form.consoleHost && state.consoleHosts.length > 0 ? state.consoleHosts[0] : null,
       defaultConsoleHost: null,
       expanded: true
     });
