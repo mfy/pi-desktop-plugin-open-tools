@@ -1,0 +1,9 @@
+# 发布产物：用 scripts/pack.mjs 现场生成，不进版本库
+dist/
+
+# PI-Desktop 的本地目标/会话文件（.pi/goal 等），只有本机开发才有
+.pi/
+
+# 兜底
+node_modules/
+*.log
